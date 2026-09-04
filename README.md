@@ -17,6 +17,8 @@ Pygame 是唯一飛行輸入視窗。MuJoCo Viewer 只負責顯示模擬與相�
 ├── ipc_protocol.py            # 封包、JSON encode/decode 與驗證
 ├── launch.py                  # 啟動並清理兩個子程序
 ├── m0_benchmark.py            # M0 起飛/懸停 headless benchmark（輸出報告與 JSON）
+├── m1_realism.py              # M1 plant perturbation（質量/慣量/馬達效率/drag）與量測雜訊層
+├── m1_benchmark.py            # M1 robustness 矩陣 benchmark（輸出 m1_robustness_report.json）
 ├── requirements.txt
 ├── pytest.ini
 └── tests/
@@ -26,7 +28,11 @@ Pygame 是唯一飛行輸入視窗。MuJoCo Viewer 只負責顯示模擬與相�
     ├── test_udp_integration.py
     ├── test_smoke.py
     ├── test_m0_physics.py     # 自由落體 / 懸停推力 / mixer 方向的物理 sanity tests
-    └── test_m0_benchmark.py   # M0 驗收：1.5 m 起飛 + 5 s 懸停
+    ├── test_m0_benchmark.py   # M0 驗收：1.5 m 起飛 + 5 s 懸停
+    ├── test_m1_motor_dynamics.py  # 一階馬達延遲步階響應
+    ├── test_m1_measurements.py    # 量測雜訊：seed 重現性、零雜訊、合法旋轉
+    ├── test_m1_robustness.py      # 質量/慣量/效率 perturbation、drag、不對稱暫態
+    └── test_m1_benchmark.py       # M1 驗收：10 個 case 的 robustness 矩陣
 ```
 
 ## 建議閱讀順序
@@ -335,6 +341,55 @@ python m0_benchmark.py
 - M0 物理 sanity tests：自由落體加速度、懸停推力 m·g/4、推力方向、
   roll/pitch/yaw mixer 產生的力矩符號
 - M0 benchmark：起飛到 1.5 m 並懸停 5 秒的完整驗收門檻
+
+## M1 非理想 robustness
+
+M0 是理想剛體/控制 baseline；M1 問的是：「當 plant 與量測不再完美時，
+同一套控制器與任務架構是否仍然穩定？」M1 只加入溫和、可理解的非理想
+因素，**不是**最終 RM 微型無人機的驗證物理模型，而是 ideal simulation
+與日後 system identification / Sim-to-Real 之間的 robustness bridge。
+
+### 非理想因素
+
+- **馬達一階延遲**（`models/quadrotor_m1.xml`）：`<motor>` shortcut 換成
+  等價 `<general dyntype="filterexact" dynprm="0.040 ...">`，實際推力遵循
+  Ḟ=(u−F)/τ，τ=0.040 s（測試另覆蓋 0.020/0.080）。名稱、site、gear、
+  ctrlrange、推力單位（牛頓）與 M0 完全相同。
+- **空氣阻力**（M1 XML 內建，`density=1.2`、`viscosity=1.8e-5`）：
+  MuJoCo 內建流體交互以等效橢球近似對機體 geom 施加與速度反向的
+  阻力/黏性項；不含槳葉尾流、地面效應或升力。`PlantConfig(drag=...)`
+  可在任一模型上開關。
+- **質量/慣量不確定性**（`PlantConfig(mass_scale=, inertia_scale=)`）：
+  ±10%。物理模型改變，但 controller 永遠使用 nominal 1.0 kg 與
+  (0.018, 0.018, 0.030)——這正是「不確定性」的意義。
+- **馬達效率不一致**（`PlantConfig(motor_effectiveness=)`，順序為
+  FL/FR/RR/RL）：實際推力 = effectiveness × 指令推力，以 actuator
+  fixed gain 實現。M1 nominal 不對稱 case 為 (0.97, 1.00, 0.99, 1.02)，
+  會在起飛時產生可量測的 pitch/yaw 擾動，由控制器回授吸收。
+- **量測雜訊**（`NoiseConfig` + seeded `MeasurementModel`）：位置
+  σ=0.010 m、速度 σ=0.020 m/s、姿態以小旋轉向量擾動 σ=0.2°
+  （保證仍是合法旋轉，不直接對 quaternion 分量加噪）、角速度
+  σ=0.01 rad/s。雜訊只進入控制器看到的 measured state；ground truth
+  保留給狀態機、安全檢查與 metrics。相同 seed 完全可重現。
+- **高度積分項**（M1 對控制器的唯一修改）：純 PD 在 ±10% 質量下有
+  恆定誤差 e=Δm·g/kp_z=0.196 m（實測），導致永遠無法進入 HOVERING。
+  因此在垂直通道加入小積分（ki_z=1.5，積分貢獻限幅 ±2.0 m/s²），
+  消除恆定力偏差；M0 全部測試與 benchmark 維持通過。
+
+### M1 benchmark
+
+```bash
+python m1_benchmark.py          # 10 個 case，輸出 m1_robustness_report.json
+```
+
+每個 case 固定一組 plant 參數跑完整 production path（action → 狀態機 →
+控制器 → mixer → actuator → MuJoCo → measurement → 控制器），起飛到
+1.5 m 後懸停 5 秒。Case 0 為 M0-like 參照；case 9 為全部非理想因素
+疊加（seed 27，完全可重現）。
+
+每個 case 的通過門檻：final altitude error < 0.15 m、hover RMS < 0.10 m、
+水平漂移 < 0.15 m、起飛暫態後 roll/pitch < 7°、懸停水平速度 < 0.30 m/s、
+懸停滿 5 s、無 NaN/Inf、無穿地、無持續 actuator 飽和（< 20%）。
 
 ## M0 驗證
 

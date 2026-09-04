@@ -44,6 +44,12 @@ from ipc_protocol import (
     decode_command,
     encode_telemetry,
 )
+from m1_realism import (
+    MeasurementModel,
+    NoiseConfig,
+    PlantConfig,
+    apply_plant_config,
+)
 
 
 # 狀態機是飛行模式的唯一來源；UI 只能送 action，不能直接指定下一個 state。
@@ -446,10 +452,25 @@ class QuadrotorSimulation:
         self,
         model_path: Path = DEFAULT_MODEL_PATH,
         parameters: FlightParameters | None = None,
+        plant_config: PlantConfig | None = None,
+        noise_config: NoiseConfig | None = None,
+        noise_seed: int = 0,
     ) -> None:
         self.model_path = Path(model_path)
         self.model, self.data, self.controller = load_simulation(self.model_path)
         self.parameters = parameters or FlightParameters()
+        # M1：plant_config 在 controller 建立之後才套用，因此 controller 永遠
+        # 使用 nominal 參數，而物理模型使用 perturb 後的參數（這才是不確定性）。
+        self.plant_config = plant_config or PlantConfig()
+        apply_plant_config(self.model, self.data, self.plant_config)
+        self.noise_config = noise_config
+        self.noise_seed = noise_seed
+        # M1：measurement 為 None 時控制器直接讀 ground truth（M0 行為不變）。
+        self.measurement = (
+            MeasurementModel(noise_config, noise_seed)
+            if noise_config is not None
+            else None
+        )
         self.machine = FlightStateMachine(
             self.controller.read_state(self.data), self.parameters
         )
@@ -466,6 +487,11 @@ class QuadrotorSimulation:
     def reset_model(self) -> None:
         mujoco.mj_resetData(self.model, self.data)
         mujoco.mj_forward(self.model, self.data)
+        self.controller.reset_vertical_integrator()
+        # plant_config 作用在 MjModel 上，reset 後仍然有效；noise 重建 RNG
+        # 讓每次 rollout 的雜訊序列可重現。
+        if self.noise_config is not None:
+            self.measurement = MeasurementModel(self.noise_config, self.noise_seed)
         self.machine = FlightStateMachine(
             self.controller.read_state(self.data), self.parameters
         )
@@ -541,8 +567,16 @@ class QuadrotorSimulation:
             self.last_motor_thrusts = np.zeros(4, dtype=float)
             mujoco.mj_step(self.model, self.data)
         else:
+            # M1：控制器只看到 noisy measured state；狀態機與安全檢查
+            # 仍使用 ground truth。
+            measured = (
+                self.measurement.measure(vehicle)
+                if self.measurement is not None
+                else None
+            )
             output = step_controller(
-                self.model, self.data, self.controller, target
+                self.model, self.data, self.controller, target,
+                measured_state=measured,
             )
             self.last_motor_thrusts = output.motor_thrusts.copy()
 

@@ -49,6 +49,12 @@ class ControllerParameters:
     position_kd: FloatArray = field(
         default_factory=lambda: np.array([2.4, 2.4, 3.2], dtype=float)
     )
+    # M1 robustness：純 PD 在質量誤差下會有恆定懸停誤差
+    # e = Δm·g/kp_z（+10% 質量 → 0.196 m，實測確認）。垂直通道加上
+    # 小積分項可把恆定力偏差（質量誤差、馬達效率誤差）收斂到零。
+    # 只作用於 z 軸，並以 max_vertical_integral_accel 限幅防止 windup。
+    position_ki_z: float = 1.5
+    max_vertical_integral_accel: float = 2.0
     attitude_kp: FloatArray = field(
         default_factory=lambda: np.array([0.8, 0.8, 0.22], dtype=float)
     )
@@ -191,6 +197,8 @@ class QuadrotorController:
             raise ValueError("model must contain body 'quadrotor' and free joint 'root'")
         self.qpos_address = int(model.jnt_qposadr[self.root_joint_id])
         self.mass = float(model.body_mass[self.body_id])
+        # 垂直誤差積分器（單位：m·s），只服務 altitude channel。
+        self._vertical_error_integral = 0.0
 
         actuator_names = tuple(
             mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, actuator_id)
@@ -212,6 +220,11 @@ class QuadrotorController:
         if np.linalg.matrix_rank(self.allocation_matrix) != 4:
             raise ValueError("rotor allocation matrix is singular")
         self.inverse_allocation_matrix = np.linalg.inv(self.allocation_matrix)
+
+    def reset_vertical_integrator(self) -> None:
+        """Clear the altitude integrator (called on simulation reset)."""
+
+        self._vertical_error_integral = 0.0
 
     def _build_allocation_matrix(self) -> FloatArray:
         """Map FL/FR/RR/RL thrusts to [force_z, torque_x/y/z]."""
@@ -296,6 +309,21 @@ class QuadrotorController:
             parameters.position_kp * position_error
             + parameters.position_kd * velocity_error
         )
+        # 垂直積分項：以 model timestep 積分高度誤差，ki 與積分上限都很小，
+        # 穩態時補償恆定力偏差，transient 時幾乎不影響原本的 PD 行為。
+        integral_limit = (
+            parameters.max_vertical_integral_accel / parameters.position_ki_z
+        )
+        self._vertical_error_integral = float(
+            np.clip(
+                self._vertical_error_integral + position_error[2] * self.model.opt.timestep,
+                -integral_limit,
+                integral_limit,
+            )
+        )
+        feedback_acceleration[2] += (
+            parameters.position_ki_z * self._vertical_error_integral
+        )
         feedback_acceleration[2] = np.clip(
             feedback_acceleration[2],
             -parameters.max_vertical_feedback,
@@ -379,8 +407,14 @@ class QuadrotorController:
             raise SimulationSafetyError("motor thrust command is invalid")
         return motor_thrusts
 
-    def update(self, data: mujoco.MjData, target: ControlTarget) -> ControlOutput:
-        state = self.read_state(data)
+    def update(
+        self,
+        data: mujoco.MjData,
+        target: ControlTarget,
+        measured_state: QuadrotorState | None = None,
+    ) -> ControlOutput:
+        # M1 measurement noise 由 measured_state 注入；預設仍讀 ground truth。
+        state = measured_state if measured_state is not None else self.read_state(data)
         total_thrust, desired_rotation = self.position_control(state, target)
         body_torque = self.attitude_control(state, desired_rotation)
         motor_thrusts = self.mix_controls(total_thrust, body_torque)
@@ -432,9 +466,11 @@ def step_controller(
     data: mujoco.MjData,
     controller: QuadrotorController,
     target: ControlTarget,
+    measured_state: QuadrotorState | None = None,
 ) -> ControlOutput:
     # 一個 timestep 的固定順序：讀狀態/算控制 → 寫 actuator → 安全檢查 → 積分。
-    output = controller.update(data, target)
+    # measured_state 只影響控制器看到的狀態；安全檢查永遠用 ground truth。
+    output = controller.update(data, target, measured_state=measured_state)
     data.ctrl[:] = output.motor_thrusts
     check_runtime_safety(
         controller.read_state(data), output.motor_thrusts, controller, data.time
