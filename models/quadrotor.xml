@@ -1,0 +1,60 @@
+<mujoco model="minimal_x_quadrotor">
+  <compiler angle="degree" autolimits="true"/>
+  <!-- 控制迴圈與物理積分共用 0.002 s timestep，也就是 500 Hz。 -->
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="RK4"/>
+
+  <visual>
+    <headlight ambient="0.35 0.35 0.35" diffuse="0.75 0.75 0.75" specular="0.2 0.2 0.2"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="135" elevation="-22"/>
+  </visual>
+
+  <asset>
+    <texture name="sky" type="skybox" builtin="gradient" rgb1="0.18 0.28 0.40" rgb2="0.02 0.03 0.05" width="512" height="3072"/>
+    <texture name="grid" type="2d" builtin="checker" rgb1="0.25 0.25 0.25" rgb2="0.35 0.35 0.35" width="512" height="512"/>
+    <material name="ground_material" texture="grid" texrepeat="10 10" reflectance="0.08"/>
+    <material name="carbon" rgba="0.10 0.12 0.14 1"/>
+    <material name="front" rgba="0.90 0.18 0.12 1"/>
+    <material name="rear" rgba="0.15 0.40 0.90 1"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 0 5" dir="0 0 -1" directional="true"/>
+    <geom name="ground" type="plane" size="12 12 0.1" material="ground_material" friction="1 0.005 0.0001"/>
+
+    <!-- 機體座標：+X 朝紅色機鼻、+Y 朝左、+Z 朝上；控制器也遵守此約定。 -->
+    <body name="quadrotor" pos="0 0 0.12">
+      <freejoint name="root"/>
+      <!-- 明確指定 1 kg 質量與主軸慣量，避免 MuJoCo 從外觀 geom 反推。 -->
+      <inertial pos="0 0 0" mass="1.0" diaginertia="0.018 0.018 0.030"/>
+
+      <geom name="fuselage" type="box" size="0.105 0.075 0.035" material="carbon"/>
+      <geom name="arm_fl_rr" type="capsule" fromto="-0.163 -0.163 0 0.163 0.163 0" size="0.012" material="carbon"/>
+      <geom name="arm_fr_rl" type="capsule" fromto="-0.163 0.163 0 0.163 -0.163 0" size="0.012" material="carbon"/>
+
+      <!-- 紅色機鼻只用於辨認 +X，方便觀察 WASD 是否依當前 yaw 移動。 -->
+      <geom name="nose" type="box" pos="0.125 0 0" size="0.035 0.045 0.020" material="front"/>
+
+      <!-- prop_* 只負責外觀；真正的力施加在下方同位置的 rotor_*_site。 -->
+      <geom name="prop_fl" type="cylinder" pos="0.163 0.163 0.012" size="0.055 0.004" material="front" contype="0" conaffinity="0"/>
+      <geom name="prop_fr" type="cylinder" pos="0.163 -0.163 0.012" size="0.055 0.004" material="front" contype="0" conaffinity="0"/>
+      <geom name="prop_rr" type="cylinder" pos="-0.163 -0.163 0.012" size="0.055 0.004" material="rear" contype="0" conaffinity="0"/>
+      <geom name="prop_rl" type="cylinder" pos="-0.163 0.163 0.012" size="0.055 0.004" material="rear" contype="0" conaffinity="0"/>
+
+      <site name="rotor_fl_site" pos="0.163 0.163 0.012" size="0.014" rgba="1 0.3 0.2 1"/>
+      <site name="rotor_fr_site" pos="0.163 -0.163 0.012" size="0.014" rgba="1 0.3 0.2 1"/>
+      <site name="rotor_rr_site" pos="-0.163 -0.163 0.012" size="0.014" rgba="0.2 0.5 1 1"/>
+      <site name="rotor_rl_site" pos="-0.163 0.163 0.012" size="0.014" rgba="0.2 0.5 1 1"/>
+    </body>
+  </worldbody>
+
+  <!-- 每個 motor 的 ctrl 直接表示該槳推力（N）。gear 前三項的 0 0 1
+       表示沿 site 局部 +Z 施力；最後一項是每牛頓推力伴隨的反作用偏航
+       力矩（N·m/N）。FL/FR/RR/RL 正負交錯，模擬相鄰旋翼反向旋轉。 -->
+  <actuator>
+    <motor name="rotor_fl" site="rotor_fl_site" gear="0 0 1 0 0 0.018" ctrlrange="0 8"/>
+    <motor name="rotor_fr" site="rotor_fr_site" gear="0 0 1 0 0 -0.018" ctrlrange="0 8"/>
+    <motor name="rotor_rr" site="rotor_rr_site" gear="0 0 1 0 0 0.018" ctrlrange="0 8"/>
+    <motor name="rotor_rl" site="rotor_rl_site" gear="0 0 1 0 0 -0.018" ctrlrange="0 8"/>
+  </actuator>
+</mujoco>

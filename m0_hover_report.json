@@ -1,0 +1,19 @@
+{
+  "target_altitude": 1.5,
+  "hover_duration_requested": 5.0,
+  "hover_duration_measured": 5.0,
+  "reached_hovering": true,
+  "stayed_hovering": true,
+  "final_altitude": 1.499993363285506,
+  "final_altitude_error": 6.636714493968299e-06,
+  "max_altitude_error": 0.036282952195452634,
+  "hover_rms_error": 0.006723043645862032,
+  "max_horizontal_drift": 0.0,
+  "max_speed": 0.09131352371973475,
+  "max_roll_deg": 0.0,
+  "max_pitch_deg": 0.0,
+  "crashed": false,
+  "has_nan_or_inf": false,
+  "passed": true,
+  "reasons": []
+}
