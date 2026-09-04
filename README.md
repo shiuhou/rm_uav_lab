@@ -9,7 +9,8 @@ Pygame 是唯一飛行輸入視窗。MuJoCo Viewer 只負責顯示模擬與相�
 ```text
 .
 ├── models/
-│   └── quadrotor.xml          # 1 kg X 型四旋翼與四個 site actuators
+│   ├── quadrotor.xml          # M0 理想模型：1 kg X 型四旋翼與四個 site actuators
+│   └── quadrotor_m1.xml       # M1 模型：filterexact 馬達延遲 + MuJoCo 流體阻力
 ├── fly.py                     # 核心位置/SO(3)姿態控制器與相容 hover CLI
 ├── simulator.py               # MuJoCo、flight state machine、IPC server
 ├── pygame_controller.py       # 獨立 Pygame UI、鍵盤焦點與 IPC client
@@ -19,6 +20,8 @@ Pygame 是唯一飛行輸入視窗。MuJoCo Viewer 只負責顯示模擬與相�
 ├── m0_benchmark.py            # M0 起飛/懸停 headless benchmark（輸出報告與 JSON）
 ├── m1_realism.py              # M1 plant perturbation（質量/慣量/馬達效率/drag）與量測雜訊層
 ├── m1_benchmark.py            # M1 robustness 矩陣 benchmark（輸出 m1_robustness_report.json）
+├── m2_mission.py              # M2 任務狀態機（READY→TAKEOFF→…→DONE/FAILED）與 heading-relative frame
+├── m2_benchmark.py            # M2 自主任務 benchmark（輸出 m2_mission_report.json）
 ├── requirements.txt
 ├── pytest.ini
 └── tests/
@@ -32,7 +35,10 @@ Pygame 是唯一飛行輸入視窗。MuJoCo Viewer 只負責顯示模擬與相�
     ├── test_m1_motor_dynamics.py  # 一階馬達延遲步階響應
     ├── test_m1_measurements.py    # 量測雜訊：seed 重現性、零雜訊、合法旋轉
     ├── test_m1_robustness.py      # 質量/慣量/效率 perturbation、drag、不對稱暫態
-    └── test_m1_benchmark.py       # M1 驗收：10 個 case 的 robustness 矩陣
+    ├── test_m1_benchmark.py       # M1 驗收：10 個 case 的 robustness 矩陣
+    ├── test_m2_mission.py         # M2 任務狀態機：phase 轉移、timeout、measured/truth 分離
+    ├── test_m2_frames.py          # M2 heading-relative frame 投影
+    └── test_m2_benchmark.py       # M2 驗收：12 個 case 的任務矩陣 + heading 不變性
 ```
 
 ## 建議閱讀順序
@@ -324,6 +330,8 @@ python -m pytest -q
 python simulator.py --headless --scenario takeoff_hover --duration 8
 python simulator.py --headless --scenario takeoff_land --duration 14
 python m0_benchmark.py
+python m1_benchmark.py
+python m2_benchmark.py
 ```
 
 測試涵蓋：
@@ -341,6 +349,9 @@ python m0_benchmark.py
 - M0 物理 sanity tests：自由落體加速度、懸停推力 m·g/4、推力方向、
   roll/pitch/yaw mixer 產生的力矩符號
 - M0 benchmark：起飛到 1.5 m 並懸停 5 秒的完整驗收門檻
+- M2 任務狀態機單元測試：phase 轉移、連續穩定計時、timeout、
+  measured-state 決策與 ground-truth 評分結構性分離、heading 投影
+- M2 benchmark：起飛 → 前進 5 m → 煞車 → 懸停 → 降落的 12 case 驗收
 
 ## M1 非理想 robustness
 
@@ -364,8 +375,11 @@ M0 是理想剛體/控制 baseline；M1 問的是：「當 plant 與量測不再
   (0.018, 0.018, 0.030)——這正是「不確定性」的意義。
 - **馬達效率不一致**（`PlantConfig(motor_effectiveness=)`，順序為
   FL/FR/RR/RL）：實際推力 = effectiveness × 指令推力，以 actuator
-  fixed gain 實現。M1 nominal 不對稱 case 為 (0.97, 1.00, 0.99, 1.02)，
-  會在起飛時產生可量測的 pitch/yaw 擾動，由控制器回授吸收。
+  fixed gain 實現。M1 nominal 不對稱 case 依馬達名稱明確定義為
+  **FL=0.97、FR=1.00、RR=0.99、RL=1.02**（tuple `(0.97, 1.00, 0.99, 1.02)`
+  對應 actuator 順序 FL/FR/RR/RL），會在起飛時產生可量測的 pitch/yaw
+  擾動，由控制器回授吸收。tuple 順序由測試依 actuator 名稱鎖定，
+  不可只依賴文字描述。
 - **量測雜訊**（`NoiseConfig` + seeded `MeasurementModel`）：位置
   σ=0.010 m、速度 σ=0.020 m/s、姿態以小旋轉向量擾動 σ=0.2°
   （保證仍是合法旋轉，不直接對 quaternion 分量加噪）、角速度
@@ -390,6 +404,73 @@ python m1_benchmark.py          # 10 個 case，輸出 m1_robustness_report.json
 每個 case 的通過門檻：final altitude error < 0.15 m、hover RMS < 0.10 m、
 水平漂移 < 0.15 m、起飛暫態後 roll/pitch < 7°、懸停水平速度 < 0.30 m/s、
 懸停滿 5 s、無 NaN/Inf、無穿地、無持續 actuator 飽和（< 20%）。
+
+## M2 自主任務：起飛 → 前進 5 m → 煞車 → 懸停 → 降落
+
+M0 驗證理想 plant/controller，M1 驗證非理想 robustness；M2 問的是：
+「同一條 production path 能否完成一段有限距離的自主任務？」任務圖：
+
+```text
+READY → TAKEOFF → SETTLE → FORWARD → BRAKE → HOVER → LAND → DONE
+                          （任何階段 timeout / 異常 → FAILED，附明確原因）
+```
+
+### Measured-state 決策 vs ground-truth 評分
+
+M2 的核心規則：**mission 狀態機只看 measured state**（含 M1 量測雜訊），
+ground truth 只用於 benchmark 評分、安全檢查與 NaN/runaway 偵測。
+起飛完成、前進 5 m 到達、煞車完成、懸停穩定都由量測值判定——
+MissionStateMachine 的 API 結構上不接受 truth state。因此報表刻意分開
+記錄「飛機以為的位置」與「實際位置」（例如 combined case 在 LAND 前：
+measured 5.122 m vs truth 5.113 m）。這個差距是日後 estimator 工作的
+核心指標，不可合併成單一「距離」。
+
+### Heading-relative 任務座標
+
+「前進 5 m」定義為**任務起始時機頭方向的 5 m**，不是世界 +X。任務開始
+時由 measured state 記錄 p0_xy 與 yaw0，定義：
+
+```text
+h = [cos yaw0, sin yaw0]   # 起始航向單位向量
+l = [-sin yaw0, cos yaw0]  # 橫向單位向量
+forward_progress = dot(p_xy - p0_xy, h)
+lateral_error    = dot(p_xy - p0_xy, l)
+```
+
+yaw0 = 0° 時世界軌跡沿 +X；yaw0 = 90°（case10/11）時沿 +Y，
+兩者的 projected forward displacement 都 ≈ 5 m。
+
+### 速度命令剖面
+
+FORWARD 依 measured 剩餘距離產生距離感知的速度命令：
+remaining > slowdown_distance（2.0 m）時巡航 0.8 m/s；進入減速段後
+v = max_speed × remaining / slowdown_distance，並以 minimum_approach_speed
+（0.05 m/s）做下限。到達門檻後命令歸零進入 BRAKE，要求 measured
+水平速度 < 0.20 m/s 連續 0.4 s 才算煞車完成，之後懸停 1.0 s 再降落。
+
+注意：本專案的高層介面是 position-mode（速度命令被積分成位置 target
+再由控制器追蹤），target 會「領先」機身約 v × τ_cascade。因此減速段
+必須在機身到達前足夠早開始（slowdown_distance 需大於巡航領先量
+≈ 1.1 m，實測 1.0 m 會衝到 5.46 m），minimum_approach_speed 也不能
+太大（0.15 m/s 時 target 凍結後機身仍多走約 0.44 m，實測超出
+5.3 m 門檻）。這兩個參數是任務層修正，控制器本身維持 M1 驗證值。
+
+### M2 benchmark 與通過門檻
+
+```bash
+python m2_benchmark.py          # 12 個 case，輸出 m2_mission_report.json
+```
+
+Case 0 為 nominal 參照；case 1–9 逐一疊加 M1 非理想因素（馬達延遲、
+質量/慣量 ±10%、drag、量測雜訊、馬達 mismatch，case 9 為全部疊加、
+seed 27）；case 10/11 驗證 yaw0 = 90° 的 heading 不變性。每個 case
+的通過門檻：mission DONE、truth 起飛高度誤差 < 0.15 m、LAND 前
+truth 前進位移 4.7–5.3 m、|truth 橫向位移| < 0.20 m、進入 HOVER 時
+truth 水平速度 < 0.30 m/s、最大傾角 < 10°（robust case < 15°）、
+飽和比例 < 20%、無 NaN/Inf、無穿地。
+
+M2 仍然不是最終 RM 微型無人機的物理模型；它是 estimator / 定位層
+（M3）之前的最後一個 ground-truth-scored 任務里程碑。
 
 ## M0 驗證
 
@@ -437,8 +518,10 @@ policy 或 companion computer 只需要輸出 (vx, vy, vz, yaw_rate)，經過
 
 ## 目前限制
 
-- 使用 MuJoCo ground-truth state，沒有感測器噪聲或 estimator。
-- 沒有 motor lag、真實槳葉、ground effect、drag 或複雜氣動。
+- 控制器與 M2 任務已透過 M1 量測雜訊層取得 measured state，但仍沒有
+  真正的 estimator（無 IMU 積分、optical flow、ToF 或濾波器）。
+- 馬達以一階 lag 近似，沒有真實槳葉氣動、ground effect 或電池電壓
+  衰退；drag 為 MuJoCo 等效橢球流體近似。
 - UDP 僅供同一台機器的簡單控制，不是 MAVLink，也沒有加密或遠端網路支援。
 - 失聯策略是懸停，不會自動返航或自動降落。
 - 這是易懂、可擴充的 simulation baseline，不代表實機飛行安全性。

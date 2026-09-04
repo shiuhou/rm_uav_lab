@@ -455,6 +455,7 @@ class QuadrotorSimulation:
         plant_config: PlantConfig | None = None,
         noise_config: NoiseConfig | None = None,
         noise_seed: int = 0,
+        initial_yaw: float = 0.0,
     ) -> None:
         self.model_path = Path(model_path)
         self.model, self.data, self.controller = load_simulation(self.model_path)
@@ -463,6 +464,11 @@ class QuadrotorSimulation:
         # 使用 nominal 參數，而物理模型使用 perturb 後的參數（這才是不確定性）。
         self.plant_config = plant_config or PlantConfig()
         apply_plant_config(self.model, self.data, self.plant_config)
+        # M2：初始航向（rad）用於 heading-invariance 測試；這是初始條件，
+        # 不是飛行中的狀態篡改。注意：必須在 apply_plant_config 之後設定，
+        # 因為其中的 mj_setConst 會把 qpos 重置回 qpos0。
+        self.initial_yaw = float(initial_yaw)
+        self._apply_initial_yaw()
         self.noise_config = noise_config
         self.noise_seed = noise_seed
         # M1：measurement 為 None 時控制器直接讀 ground truth（M0 行為不變）。
@@ -474,6 +480,13 @@ class QuadrotorSimulation:
         self.machine = FlightStateMachine(
             self.controller.read_state(self.data), self.parameters
         )
+        initial_truth = self.controller.read_state(self.data)
+        # 每一步的 measured state；無 noise model 時即 ground truth（M0 行為）。
+        self.last_measured_state = (
+            self.measurement.measure(initial_truth)
+            if self.measurement is not None
+            else initial_truth
+        )
         self.manual_axes = ManualAxes()
         self.last_motor_thrusts = np.zeros(4, dtype=float)
         self.last_command_sequence = -1
@@ -484,8 +497,19 @@ class QuadrotorSimulation:
         self.max_altitude = float(self.controller.read_state(self.data).position[2])
         self.min_up_axis_z = 1.0
 
+    def _apply_initial_yaw(self) -> None:
+        if self.initial_yaw == 0.0:
+            return
+        half = 0.5 * self.initial_yaw
+        address = self.controller.qpos_address
+        self.data.qpos[address + 3 : address + 7] = (
+            math.cos(half), 0.0, 0.0, math.sin(half),
+        )
+        mujoco.mj_forward(self.model, self.data)
+
     def reset_model(self) -> None:
         mujoco.mj_resetData(self.model, self.data)
+        self._apply_initial_yaw()
         mujoco.mj_forward(self.model, self.data)
         self.controller.reset_vertical_integrator()
         # plant_config 作用在 MjModel 上，reset 後仍然有效；noise 重建 RNG
@@ -494,6 +518,14 @@ class QuadrotorSimulation:
             self.measurement = MeasurementModel(self.noise_config, self.noise_seed)
         self.machine = FlightStateMachine(
             self.controller.read_state(self.data), self.parameters
+        )
+        # 與 __init__ 一致：measured state 必須經過 measurement model，
+        # 否則 noise case 下 mission 起點會洩漏 ground truth。
+        reset_truth = self.controller.read_state(self.data)
+        self.last_measured_state = (
+            self.measurement.measure(reset_truth)
+            if self.measurement is not None
+            else reset_truth
         )
         self.manual_axes = ManualAxes()
         self.last_motor_thrusts = np.zeros(4, dtype=float)
@@ -542,10 +574,19 @@ class QuadrotorSimulation:
 
     def step(self, now: float) -> QuadrotorState:
         vehicle = self.controller.read_state(self.data)
+        # M1/M2：noise 在每個 tick 只取樣一次，guidance（target 積分的
+        # heading 參考）與 controller 使用同一份 measured state；
+        # 無 noise model 時兩者都是 ground truth。
+        measured = (
+            self.measurement.measure(vehicle)
+            if self.measurement is not None
+            else None
+        )
+        self.last_measured_state = measured if measured is not None else vehicle
         self._apply_timeout(now, vehicle)
         self.machine.integrate_manual(
             self.manual_axes,
-            vehicle,
+            self.last_measured_state,
             self.model.opt.timestep,
             self.data.time,
         )
@@ -567,13 +608,7 @@ class QuadrotorSimulation:
             self.last_motor_thrusts = np.zeros(4, dtype=float)
             mujoco.mj_step(self.model, self.data)
         else:
-            # M1：控制器只看到 noisy measured state；狀態機與安全檢查
-            # 仍使用 ground truth。
-            measured = (
-                self.measurement.measure(vehicle)
-                if self.measurement is not None
-                else None
-            )
+            # 控制器只看到 measured state；安全檢查永遠用 ground truth。
             output = step_controller(
                 self.model, self.data, self.controller, target,
                 measured_state=measured,
