@@ -4,6 +4,45 @@
 
 Pygame 是唯一飛行輸入視窗。MuJoCo Viewer 只負責顯示模擬與相機操作，沒有註冊 WASD、Q/E、R/F、T、L 等飛行 callback。Pygame 不會修改 MuJoCo state，也不會發送四個馬達推力。
 
+## 實驗室脈絡（RM UAV Lab）
+
+本 repo 是 RM UAV Lab 工作區中的 **MuJoCo 自主飛行堆疊子專案**。工作區
+內還存在另一套模擬工作（刻意**不**收進本 repo）：
+
+- **ArduPilot SITL**（`~/rm_uav_lab/ardupilot/`）：未修改的上游 checkout
+  （6.6 GB，origin 為 ArduPilot/ardupilot.git），隨時可重新 clone，因此
+  不複製進版控。
+- **Gazebo 工作區**（`~/rm_uav_lab/gz_ws/`）：ArduPilot SITL 搭配的
+  Gazebo 模擬環境。
+- **pymavlink 任務腳本**（`~/rm_uav_lab/missions/`）：SITL 上的
+  takeoff → forward → land 系列，演進到 **V5 軌跡腳本**
+  （`takeoff_forward_land_v5_trajectory.py`）。這條 V5 軌跡是本專案的
+  最終重現目標之一；M0 的原始目的就是在重現它之前先建立可信、可測的
+  MuJoCo baseline。
+- 其他：`reset_sim_v2.sh`、`params/`、`notes/`、`tools/`。
+
+排除它們的原因：ardupilot/ 是公開上游程式碼且無本地修改；gz_ws 含有
+大量第三方 vendored 套件；GitHub 單檔 100 MB 上限。這些 SITL/Gazebo
+產物日後適合獨立成一個 `rm_uav_sitl` repo。
+
+## Milestone 進程（M0–M3 已驗證）
+
+| Milestone | 內容 | 驗證 |
+|---|---|---|
+| M0 | 理想剛體 plant + 位置/SO(3) 控制器 baseline；物理 sanity tests（自由落體、懸停推力 m·g/4、mixer 方向）；1.5 m 起飛 + 5 s 懸停 benchmark | `m0_benchmark.py` PASS |
+| M1 | 溫和 Sim-to-Real robustness：馬達一階延遲（40 ms）、流體阻力、質量/慣量 ±10%、馬達效率不一致、seeded 量測雜訊；z 軸小積分項 | `m1_benchmark.py` PASS（10 cases） |
+| M2 | 自主任務：起飛 → 前進 5 m（相對起飛航向）→ 煞車 → 懸停 → 降落；**mission 只看 measured state，ground truth 只用於評分** | `m2_benchmark.py` PASS（12 cases） |
+| M3 | GPS-denied 定位：IMU（250 Hz）+ optical-flow-like 速度（50 Hz）+ ToF 高度（50 Hz）→ complementary predict/correct estimator → EstimatedState 驅動 mission 與 controller；truth 結構性隔離 | `m3_benchmark.py` PASS（11 cases） |
+
+驗證狀態：`python -m pytest -q` → **134 passed**；上述四個 benchmark
+全部 PASS。Git 歷史即里程碑封存：M0 `5631a1f` → M1 `ad152a7` →
+M2 `7789a81` → M3 `2be0029`。
+
+下一步（M4-A）：把 1 kg 通用機換成 RM27 方向的 150–200 g / 120 mm
+wheelbase 微型機 plant（質量/幾何/慣量/推力餘裕縮放），autonomy stack
+維持不變。注意：1103 9500 KV + 2"/2.5" + 2S/3S 的推力/電流/轉速
+**尚未經實測驗證**，M4-A 只用明確標註的工程估計值。
+
 ## 專案結構
 
 ```text
