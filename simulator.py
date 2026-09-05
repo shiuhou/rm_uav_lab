@@ -50,6 +50,7 @@ from m1_realism import (
     PlantConfig,
     apply_plant_config,
 )
+from m3_sensors import TruthKinematics
 
 
 # 狀態機是飛行模式的唯一來源；UI 只能送 action，不能直接指定下一個 state。
@@ -456,10 +457,39 @@ class QuadrotorSimulation:
         noise_config: NoiseConfig | None = None,
         noise_seed: int = 0,
         initial_yaw: float = 0.0,
+        localization=None,
     ) -> None:
         self.model_path = Path(model_path)
         self.model, self.data, self.controller = load_simulation(self.model_path)
         self.parameters = parameters or FlightParameters()
+        # M3：localization（sensor->estimator pipeline）與 M1 的
+        # truth+noise measurement 是兩條互斥的導航路徑。M3 模式下
+        # controller/guidance/mission 只能看到 EstimatedState。
+        if localization is not None and noise_config is not None:
+            raise ValueError(
+                "M3 localization and M1 noise measurement are mutually "
+                "exclusive navigation paths"
+            )
+        # 接受 instance 或 factory(physics_dt)；factory 讓 reset_model 能重建
+        # 一份新的 deterministic pipeline，並讓 sensor rate divider 依據
+        # 實際 model timestep 計算。
+        self._localization_factory = (
+            localization
+            if callable(localization)
+            else (lambda physics_dt: localization)
+        )
+        self.localization = (
+            self._localization_factory(float(self.model.opt.timestep))
+            if localization is not None
+            else None
+        )
+        # ToF 的高度基準：ground plane geom 的 z（目前模型是 0）。
+        ground_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_GEOM, "ground"
+        )
+        self.ground_height = (
+            float(self.model.geom_pos[ground_id][2]) if ground_id >= 0 else 0.0
+        )
         # M1：plant_config 在 controller 建立之後才套用，因此 controller 永遠
         # 使用 nominal 參數，而物理模型使用 perturb 後的參數（這才是不確定性）。
         self.plant_config = plant_config or PlantConfig()
@@ -482,11 +512,21 @@ class QuadrotorSimulation:
         )
         initial_truth = self.controller.read_state(self.data)
         # 每一步的 measured state；無 noise model 時即 ground truth（M0 行為）。
-        self.last_measured_state = (
-            self.measurement.measure(initial_truth)
-            if self.measurement is not None
-            else initial_truth
-        )
+        # M3：localization 模式時這裡是 estimator 輸出（EstimatedState）。
+        self.last_estimated_state = None
+        if self.localization is not None:
+            self.last_estimated_state = self.localization.update(
+                self._truth_kinematics(initial_truth)
+            )
+            self.last_measured_state = (
+                self.last_estimated_state.to_quadrotor_state()
+            )
+        else:
+            self.last_measured_state = (
+                self.measurement.measure(initial_truth)
+                if self.measurement is not None
+                else initial_truth
+            )
         self.manual_axes = ManualAxes()
         self.last_motor_thrusts = np.zeros(4, dtype=float)
         self.last_command_sequence = -1
@@ -507,6 +547,27 @@ class QuadrotorSimulation:
         )
         mujoco.mj_forward(self.model, self.data)
 
+    def _truth_kinematics(self, vehicle: QuadrotorState) -> TruthKinematics:
+        """M3 sensor-boundary input. Only the sensor pipeline may consume
+        this; the estimator, controller, guidance and mission never see it.
+        acceleration_world is qacc[0:3] of the free joint, which IS the
+        world-frame linear acceleration of the body origin (contacts,
+        drag, thrust all included). NOTE: mj_objectAcceleration is NOT
+        usable here -- data.cacc is only populated when something
+        (e.g. a force sensor) forces mj_rnePostConstraint to run, and
+        this model has none, so it silently returns zeros."""
+        qvel_address = int(self.model.jnt_dofadr[self.controller.root_joint_id])
+        return TruthKinematics(
+            time=float(self.data.time),
+            position=vehicle.position.copy(),
+            quaternion_wxyz=vehicle.quaternion_wxyz.copy(),
+            rotation_body_to_world=vehicle.rotation_body_to_world.copy(),
+            velocity_world=vehicle.velocity_world.copy(),
+            angular_velocity_body=vehicle.angular_velocity_body.copy(),
+            acceleration_world=self.data.qacc[qvel_address : qvel_address + 3].copy(),
+            ground_height=self.ground_height,
+        )
+
     def reset_model(self) -> None:
         mujoco.mj_resetData(self.model, self.data)
         self._apply_initial_yaw()
@@ -516,17 +577,31 @@ class QuadrotorSimulation:
         # 讓每次 rollout 的雜訊序列可重現。
         if self.noise_config is not None:
             self.measurement = MeasurementModel(self.noise_config, self.noise_seed)
+        # M3：重建整條 sensor->estimator pipeline，重置 estimator 的
+        # local frame 與 deterministic RNG。
+        if self.localization is not None:
+            self.localization = self._localization_factory(
+                float(self.model.opt.timestep)
+            )
         self.machine = FlightStateMachine(
             self.controller.read_state(self.data), self.parameters
         )
         # 與 __init__ 一致：measured state 必須經過 measurement model，
         # 否則 noise case 下 mission 起點會洩漏 ground truth。
         reset_truth = self.controller.read_state(self.data)
-        self.last_measured_state = (
-            self.measurement.measure(reset_truth)
-            if self.measurement is not None
-            else reset_truth
-        )
+        if self.localization is not None:
+            self.last_estimated_state = self.localization.update(
+                self._truth_kinematics(reset_truth)
+            )
+            self.last_measured_state = (
+                self.last_estimated_state.to_quadrotor_state()
+            )
+        else:
+            self.last_measured_state = (
+                self.measurement.measure(reset_truth)
+                if self.measurement is not None
+                else reset_truth
+            )
         self.manual_axes = ManualAxes()
         self.last_motor_thrusts = np.zeros(4, dtype=float)
         self.timeout_active = False
@@ -545,13 +620,24 @@ class QuadrotorSimulation:
 
         if packet.action is not None and packet.sequence > self.last_action_sequence:
             vehicle = self.controller.read_state(self.data)
+            # M3：action handlers（ARM/TAKEOFF/LAND 的 target 錨定）在
+            # localization 模式下必須使用 estimated state，否則
+            # truth-anchored target（例如真實 yaw）會讓閉迴路去追一個
+            # estimator frame 裡不存在的姿態。M0/M1/M2 路徑維持原樣。
+            decision_state = (
+                self.last_measured_state
+                if self.localization is not None
+                else vehicle
+            )
             accepted = False
             if packet.action == "reset":
-                if self.machine.can_reset(vehicle):
+                if self.machine.can_reset(decision_state):
                     self.reset_model()
                     accepted = True
             else:
-                accepted = self.machine.handle_action(packet.action, vehicle, self.data.time)
+                accepted = self.machine.handle_action(
+                    packet.action, decision_state, self.data.time
+                )
             self.last_action_sequence = packet.sequence
             if accepted:
                 self.action_counts[packet.action] = (
@@ -574,15 +660,27 @@ class QuadrotorSimulation:
 
     def step(self, now: float) -> QuadrotorState:
         vehicle = self.controller.read_state(self.data)
-        # M1/M2：noise 在每個 tick 只取樣一次，guidance（target 積分的
-        # heading 參考）與 controller 使用同一份 measured state；
-        # 無 noise model 時兩者都是 ground truth。
-        measured = (
-            self.measurement.measure(vehicle)
-            if self.measurement is not None
-            else None
-        )
-        self.last_measured_state = measured if measured is not None else vehicle
+        if self.localization is not None:
+            # M3：truth 只進入 sensor pipeline；controller、guidance 與
+            # mission（經 last_measured_state）收到的都是 EstimatedState。
+            # estimator 失能時也絕不 fallback 到 truth。
+            self.last_estimated_state = self.localization.update(
+                self._truth_kinematics(vehicle)
+            )
+            measured = self.last_estimated_state.to_quadrotor_state()
+            self.last_measured_state = measured
+        else:
+            # M1/M2：noise 在每個 tick 只取樣一次，guidance（target 積分的
+            # heading 參考）與 controller 使用同一份 measured state；
+            # 無 noise model 時兩者都是 ground truth。
+            measured = (
+                self.measurement.measure(vehicle)
+                if self.measurement is not None
+                else None
+            )
+            self.last_measured_state = (
+                measured if measured is not None else vehicle
+            )
         self._apply_timeout(now, vehicle)
         self.machine.integrate_manual(
             self.manual_axes,

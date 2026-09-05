@@ -22,6 +22,9 @@ Pygame 是唯一飛行輸入視窗。MuJoCo Viewer 只負責顯示模擬與相�
 ├── m1_benchmark.py            # M1 robustness 矩陣 benchmark（輸出 m1_robustness_report.json）
 ├── m2_mission.py              # M2 任務狀態機（READY→TAKEOFF→…→DONE/FAILED）與 heading-relative frame
 ├── m2_benchmark.py            # M2 自主任務 benchmark（輸出 m2_mission_report.json）
+├── m3_sensors.py              # M3 感測器模型：IMU / optical-flow-like 速度 / ToF 高度（非 datasheet 數值）
+├── m3_estimator.py            # M3 定位估計器：IMU 預測 + flow/ToF 修正（complementary，非 Kalman）
+├── m3_benchmark.py            # M3 定位任務 benchmark（輸出 m3_localization_report.json）
 ├── requirements.txt
 ├── pytest.ini
 └── tests/
@@ -38,7 +41,11 @@ Pygame 是唯一飛行輸入視窗。MuJoCo Viewer 只負責顯示模擬與相�
     ├── test_m1_benchmark.py       # M1 驗收：10 個 case 的 robustness 矩陣
     ├── test_m2_mission.py         # M2 任務狀態機：phase 轉移、timeout、measured/truth 分離
     ├── test_m2_frames.py          # M2 heading-relative frame 投影
-    └── test_m2_benchmark.py       # M2 驗收：12 個 case 的任務矩陣 + heading 不變性
+    ├── test_m2_benchmark.py       # M2 驗收：12 個 case 的任務矩陣 + heading 不變性
+    ├── test_m3_sensors.py         # M3 感測器：符號慣例、body-frame 轉換、seed、rate、latency、dropout
+    ├── test_m3_estimator.py       # M3 估計器：積分、scale/bias 漂移、dropout health、quaternion 合法性
+    ├── test_m3_truth_isolation.py # M3 結構性 truth 隔離：stub 估計器證明 mission/controller 只吃估計值
+    └── test_m3_benchmark.py       # M3 驗收：11 個 case + 長斷訊失敗測試
 ```
 
 ## 建議閱讀順序
@@ -332,6 +339,7 @@ python simulator.py --headless --scenario takeoff_land --duration 14
 python m0_benchmark.py
 python m1_benchmark.py
 python m2_benchmark.py
+python m3_benchmark.py
 ```
 
 測試涵蓋：
@@ -352,6 +360,96 @@ python m2_benchmark.py
 - M2 任務狀態機單元測試：phase 轉移、連續穩定計時、timeout、
   measured-state 決策與 ground-truth 評分結構性分離、heading 投影
 - M2 benchmark：起飛 → 前進 5 m → 煞車 → 懸停 → 降落的 12 case 驗收
+- M3：IMU/flow/ToF 感測器模型、complementary 估計器、結構性 truth 隔離、
+  11 case 定位任務驗收 + 長斷訊 loud-failure 測試
+
+## M3 GPS-denied 定位：估計導航狀態
+
+M0 驗證理想 plant/controller；M1 加入非理想物理與「truth+白噪聲」量測；
+M2 用 measured state 完成自主任務；M3 則**移除直接位置/速度/姿態真值**，
+改成一條最小可理解的 GPS-denied 定位鏈：
+
+```text
+MuJoCo truth ──→ IMU (gyro + specific force, 250 Hz)
+             ──→ optical-flow-like body 速度 (50 Hz)
+             ──→ ToF 高度 (50 Hz)
+                     ↓
+             LocalizationEstimator（IMU 預測 + flow/ToF 修正）
+                     ↓
+             EstimatedState → mission + flight controller
+
+MuJoCo truth ──→ 評分 / 安全檢查 / 落地接觸判定（ONLY）
+```
+
+**M3 的感測器數值是工程測試值，不是 MicoAir MTF-02P 的 datasheet
+性能。** 之後的 milestone 才會用量測過的硬體數據替換。
+
+### 感測器模型（m3_sensors.py）
+
+- **IMU**：ω_meas = ω_true_body + bias + 白噪聲（σ=0.002 rad/s）；
+  specific force f = R_world→body · (a_world − g_world) + bias +
+  白噪聲（σ=0.05 m/s²）。靜止水平時 accelerometer 讀到 body +Z 的
+  +9.81 m/s²（量測的是支撐力而非重力本身），此符號慣例由測試鎖定。
+  a_world 取自 free joint 的 qacc[0:3]（mj_objectAcceleration 在此模型
+  不可用：沒有 force sensor 時 cacc 不會被計算，會靜默回傳零）。
+- **Optical-flow-like**：輸出 body frame 水平速度 scale·v_body_xy +
+  bias + 白噪聲（σ=0.03 m/s），不含任何絕對位置；**不是**影像級
+  optical flow（無相機渲染、無 feature tracking）。支援 scale error、
+  bias、dropout、固定 latency（timestamped queue，不用 sleep）。
+- **ToF**：body 原點對地面（z=0 plane）的高度 + bias + 白噪聲
+  （σ=0.01 m），有效範圍 0.05–8.0 m，範圍外 / dropout → invalid。
+  注意落地後高度 < 0.05 m 時 ToF 合理失明，因此 estimator health 只在
+  TAKEOFF..HOVER 階段作為 benchmark gate。
+
+所有感測器以 physics step counter 決定取樣（IMU 每 2 步、flow/ToF
+每 10 步，dt=0.002 s），seed 固定時 bit-identical 可重現。
+
+### 估計器（m3_estimator.py）
+
+刻意不用 Kalman filter；是可讀的 predict/correct：
+
+```text
+q ← q ⊗ exp(ω_meas·dt/2)                      # 姿態傳播（quaternion 正規化）
+a_nav = R(q_est)·f_body + g_world             # 比力轉導航系
+v += a_nav·dt ; p += v·dt + ½·a_nav·dt²       # 慣性預測
+v_xy ← (1−α_f)·v_xy + α_f·(R(q_est)·v_flow_body)_xy   # α_f = 0.35
+z   ← (1−α_t)·z + α_t·h_tof                            # α_t = 0.5
+```
+
+Estimator 有自己的 LOCAL navigation frame：啟動時 x=y=0、yaw=0
+（local +X = 起飛時機頭方向），即使 MuJoCo world yaw 是 90°。沒有
+磁力計 → gyro z bias 會造成真實 yaw drift；沒有水平位置感測器 →
+x/y 只能靠積分估計速度得到，flow scale/bias 因此會累積成**真實的
+位置誤差**。若任何時刻 x/y 與 truth bit-identical，代表 truth 洩漏，
+M3 失敗。
+
+Health：IMU 失效 > 0.05 s、flow > 0.5 s、ToF > 0.5 s 或內部狀態
+NaN/Inf → healthy=False；benchmark 中止為 ESTIMATOR_UNHEALTHY，
+**絕不 fallback 到 truth**。短斷訊（0.25 s）由慣性預測橋接。
+
+### M2 與 M3 的差異
+
+M2 的「measured state」本質仍是 truth + 白噪聲——每個通道都有真值
+為中心。M3 的 EstimatedState 由感測器模型動態生成，**會漂移**：
+estimator 以為的 5 m 與物理實際的 5 m 之差成為核心指標
+（例：case2 flow scale +2% → est 5.099 m vs truth 5.011 m）。
+
+### M3 benchmark
+
+```bash
+python m3_benchmark.py          # 11 個 case，輸出 m3_localization_report.json
+```
+
+Case 0 理想感測器（證明估計器架構本身正確）；case 1 nominal 噪聲；
+case 2/3 flow scale/bias；case 4/5 flow/ToF 短斷訊 0.25 s；case 6
+gyro z bias 0.1°/s；case 7 flow+ToF latency 20 ms；case 8 全部疊加
+（含 M1 combined plant，seed 27）；case 9/10 初始 yaw=90°。
+
+每個 case 的通過門檻（刻意容忍漂移，不要求完美 5.00 m）：
+mission DONE、LAND 前 truth 前進位移 4.5–5.5 m、|truth 橫向|
+< 0.30 m、est-vs-truth 高度 RMS < 0.15 m、最大傾角 < 15°、飽和
+< 20%、無 NaN/Inf、無穿地、estimator 在主動飛行階段全程 healthy、
+成功物理降落。
 
 ## M1 非理想 robustness
 
@@ -518,8 +616,9 @@ policy 或 companion computer 只需要輸出 (vx, vy, vz, yaw_rate)，經過
 
 ## 目前限制
 
-- 控制器與 M2 任務已透過 M1 量測雜訊層取得 measured state，但仍沒有
-  真正的 estimator（無 IMU 積分、optical flow、ToF 或濾波器）。
+- M3 已有最小定位估計器（IMU 積分 + flow/ToF 修正），但不是 EKF：
+  沒有 bias 估計、沒有磁力計/航向觀測、感測器模型不含真實 optical
+  flow 的紋理/光照依賴或 ToF 的表面材質依賴。
 - 馬達以一階 lag 近似，沒有真實槳葉氣動、ground effect 或電池電壓
   衰退；drag 為 MuJoCo 等效橢球流體近似。
 - UDP 僅供同一台機器的簡單控制，不是 MAVLink，也沒有加密或遠端網路支援。
